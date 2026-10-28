@@ -1,169 +1,129 @@
-# Cart Abandonment Prediction (Working Draft)
+# Cart Abandonment Prediction
 
-> Working notes. To be condensed before making the repo public.
-> TODO: update all results with the final run (fixed random seed).
+Predicting whether an online shopper who adds an item to the cart will complete the purchase, using 42 million behavioral events from a multi-category e-commerce store. Data processing and feature engineering are done in SQL (DuckDB); modeling and evaluation in Python (scikit-learn, LightGBM).
 
-## 1. Question and scope
+## Key findings
 
-**Question:** For sessions where a user adds an item to the cart, will the session end in a purchase?
+- **More than half of purchases bypass the cart.** 53.6% of purchasing sessions have no add-to-cart event, so cart-based funnel metrics miss most purchases.
+- **Who the user is matters more than what they do in the session.** Adding three user-history features raised LightGBM ROC-AUC from 0.625 to 0.730.
+- **The model makes reminder targeting 1.5x more precise.** Among the 20% of carts ranked riskiest, 72% are actually abandoned, versus 48% on average.
 
-**Business use:** prioritize which carts to target with abandonment reminders.
+## Business question
 
-**Scope:** only sessions with at least one add-to-cart event (573,097 sessions). Purchases without a cart event are out of scope.
+For sessions where a user adds an item to the cart, will the session end in a purchase?
 
-Why this scope: a "you left something in your cart" reminder only applies to users with items in their cart. Overall session-level purchase rate (6.8%) is a different question (e.g., homepage recommendations) and is not modeled here.
+The intended use is prioritizing which carts receive abandonment reminders. Because a "you left something in your cart" message only applies to users with items in their cart, the analysis is scoped to sessions with at least one add-to-cart event. Purchases without a cart event are out of scope.
 
-## 2. Data
+## Data
 
-- Source: [eCommerce behavior data from multi category store](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store) (Kaggle, REES46)
-- File used: `2019-Oct.csv.gz` (October 2019 only), placed in `data/raw/`
-- Why October: smallest file, no major promotion (November has Black Friday), and November can later serve as an out-of-time test set
-- One row = one event. Event types: `view`, `cart`, `purchase`
+[eCommerce behavior data from multi category store](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store) (Kaggle). October 2019 only; each row is one event (`view`, `cart`, or `purchase`).
 
-| Metric | Value |
+| | |
 |---|---|
 | Events | 42,448,764 |
 | Users | 3,022,290 |
 | Sessions | 9,244,421 |
-| Time range | 2019-10-01 to 2019-10-31 (UTC) |
-| Event mix | view 96.07%, cart 2.18%, purchase 1.75% |
+| Period | Oct 1–31, 2019 (UTC) |
+| Event mix | view 96.1%, cart 2.2%, purchase 1.7% |
 
-## 3. Pipeline
+October was chosen because it has no major promotion (November includes Black Friday), which keeps behavior representative and leaves November available as an out-of-time test set.
 
-```
-data/raw/2019-Oct.csv.gz
-  → data/processed/events_2019_10.parquet           (00_build_model_table.ipynb)
-  → data/processed/model_table.parquet              (label + session + product features)
-  → data/processed/feat_user_history.parquet        (user-history features)
-  → notebooks/01_model.ipynb                        (models, evaluation, targeting)
-```
+## Approach
 
-Intermediate DuckDB tables in `00_build_model_table.ipynb`:
+### 1. Data quality
 
-| Table | Grain | Purpose |
-|---|---|---|
-| `sessions` | one session | EDA only: cart × purchase cross-tab |
-| `first_cart` | one cart session | time of first add-to-cart (reference point for label and features) |
-| `cart_sessions` | one cart session | label |
-| `feat_pre_cart` | one cart session | pre-cart session behavior |
-| `feat_cart_product` | one cart session | attributes of the carted product |
-| `model_table` | one cart session | label + features + train/test split |
-| `feat_user_history` | one cart session | user behavior in earlier sessions |
+- `category_code` is missing for 31.8% of events, so the fully populated `category_id` is used instead.
+- `brand` is missing for 14.4% of events; tested as a feature (`cart_brand_missing`) and found to carry no signal.
+- 3.0% of cart events are exact duplicates within the same second (likely double clicks or multiple units). They are kept, since the label depends only on whether a purchase occurred.
 
-## 4. Data quality
+### 2. Session-level EDA
 
-**Missing values**
+| Cart | Purchase | Sessions | Share within cart group |
+|---|---|---|---|
+| No | No | 8,333,625 | 96.1% |
+| No | Yes | 337,699 | 3.9% |
+| Yes | No | 281,237 | 49.1% |
+| Yes | Yes | 291,861 | 50.9% |
 
-| Column | Missing | % |
-|---|---|---|
-| `category_code` | 13,515,609 | 31.84% |
-| `brand` | 6,113,008 | 14.40% |
-| `user_session` | 2 | ~0% |
-| all other columns | 0 | 0% |
+Half of cart sessions convert, and most purchasing sessions never use the cart.
 
-- `category_code` is missing for a third of events → use `category_id` (no missing values) instead
-- `brand` missing → kept; tested as a feature (`cart_brand_missing`), which turned out to have no predictive value
+### 3. Label
 
-**Exact duplicate rows** (same time, type, product, user, session, price)
+`label = 1` if the session has a purchase **after** its first add-to-cart.
 
-| Event type | Duplicates | % |
-|---|---|---|
-| cart | 28,073 | 3.0% |
-| purchase | 76 | 0.01% |
-| view | 2,071 | 0.005% |
+- 573,097 cart sessions; 50.6% positive, so no resampling is needed.
+- Purchases made before the first add-to-cart do not count.
 
-- Duplicates concentrate in cart events (likely double clicks or multiple units added in the same second)
-- Not removed: the label uses "has any purchase", which is unaffected by duplicates
+### 4. Features
 
-## 5. Key EDA finding: many purchases bypass the cart
-
-| has_cart | has_purchase | Sessions | % of all | % within cart group |
-|---|---|---|---|---|
-| 0 | 0 | 8,333,625 | 90.15% | 96.11% |
-| 0 | 1 | 337,699 | 3.65% | 3.89% |
-| 1 | 0 | 281,237 | 3.04% | 49.07% |
-| 1 | 1 | 291,861 | 3.16% | 50.93% |
-
-- Session-level cart conversion rate: **50.9%**
-- **53.6%** of purchasing sessions have no cart event → cart-based funnel metrics miss more than half of purchases
-
-## 6. Label
-
-`label = 1` if the session has a purchase **after** its first add-to-cart; otherwise 0.
-
-- 573,097 cart sessions; `label = 1`: 290,229 (50.64%) → balanced, no resampling needed
-- 1,632 sessions purchased only before their first add-to-cart → `label = 0`
-- 1 session with a NULL session ID is dropped
-
-**Limitations**
-- Only purchases within the same session count; a user who returns in a later session to buy is labeled 0
-- Session-level label: the purchased product does not have to be the carted product
-
-## 7. Features
-
-**Leakage rule:** only information available at the moment of the first add-to-cart.
+All features use only information available at the moment of the first add-to-cart, to prevent leakage.
 
 | Group | Features |
 |---|---|
-| Pre-cart session behavior | `n_views_before_cart`, `n_products_viewed_before_cart`, `secs_to_first_cart` |
-| Timing | `cart_hour`, `cart_dow` |
-| Carted product | `cart_price`, `cart_category_id`, `cart_brand_missing` |
-| User history (earlier sessions only) | `prior_purchases`, `prior_carts`, `prior_sessions` |
+| Pre-cart session behavior | views, distinct products viewed, seconds to first add-to-cart |
+| Timing | hour, day of week |
+| Carted product | price, category (categorical), brand missing |
+| User history (earlier sessions only) | prior purchases, prior add-to-carts, prior sessions |
 
-**Limitation (left censoring):** data starts on Oct 1, so early-October sessions have little visible history even for returning customers.
+### 5. Validation
 
-## 8. Validation
+Time-based split to mimic predicting future sessions from past data: Oct 1–24 for training (463,222 sessions), Oct 25–31 for testing (109,875 sessions). Predicting "purchase" for every test session gives a 51.98% accuracy baseline.
 
-Time-based split (no random shuffling), to mimic predicting future sessions from past data:
-
-| Split | Period | Sessions | % label = 1 |
-|---|---|---|---|
-| train | Oct 1–24 | 463,222 | 50.32% |
-| test | Oct 25–31 | 109,875 | 51.98% |
-
-Baseline: predicting "purchase" for everyone gives 51.98% test accuracy.
-
-## 9. Results
+## Results
 
 | Model | ROC-AUC | PR-AUC | Accuracy |
 |---|---|---|---|
-| Logistic regression | 0.5445 | 0.5497 | 0.5376 |
-| LightGBM | 0.6250 | 0.6341 | 0.5879 |
-| LightGBM (no category) | 0.6164 | 0.6278 | 0.5798 |
-| Logistic regression + history | 0.6955 | 0.7250 | 0.6396 |
-| **LightGBM + history** | **0.7298** | **0.7508** | **0.6675** |
+| Logistic regression | 0.545 | 0.550 | 53.8% |
+| LightGBM | 0.625 | 0.634 | 58.8% |
+| LightGBM (no category) | 0.617 | 0.629 | 58.0% |
+| Logistic regression + history | 0.696 | 0.725 | 64.0% |
+| **LightGBM + history** | **0.730** | **0.751** | **66.7%** |
 
-**Takeaways**
-1. **Who the user is matters more than what they do in the session.** Three user-history features raised LightGBM ROC-AUC from 0.625 to 0.730.
-2. **LightGBM beat logistic regression mainly through non-linearity, not the category feature.** Removing `cart_category_id` only lowered ROC-AUC by ~0.009.
-3. **Gain importance overstates high-cardinality features.** `cart_category_id` ranked #2 by gain (36.9%) but contributed little in the ablation.
-4. `secs_to_first_cart` was the most important feature by gain.
+- **User history drives most of the gain.** Three history features improved logistic regression by 0.151 and LightGBM by 0.105 in ROC-AUC.
+- **LightGBM's advantage comes from non-linearity, not the category feature.** Removing `cart_category_id` lowers ROC-AUC by only 0.008, while LightGBM still beats logistic regression by 0.073 on identical features.
+- **Gain importance can mislead.** `cart_category_id` ranks first by gain importance (37.1%, essentially tied with time-to-cart), yet the ablation shows it contributes little on the test set.
 
-## 10. Targeting analysis
+## Targeting analysis
 
-Rank test sessions by predicted abandonment probability (LightGBM + history):
+Test sessions ranked by predicted abandonment probability (LightGBM + history):
 
-| Top % targeted | Sessions | Actual abandon rate | Lift |
-|---|---|---|---|
-| 10% | 10,987 | 76.22% | 1.59 |
-| 20% | 21,975 | 72.42% | 1.51 |
-| 30% | 32,962 | 69.68% | 1.45 |
-| 50% | 54,937 | 64.83% | 1.35 |
-| 100% | 109,875 | 48.02% | 1.00 |
+| Top % targeted | Actual abandonment rate | Lift vs. random |
+|---|---|---|
+| 10% | 76.1% | 1.58 |
+| 20% | 72.3% | 1.51 |
+| 30% | 69.7% | 1.45 |
+| 50% | 64.8% | 1.35 |
+| All | 48.0% | 1.00 |
 
-**Recommendation:** targeting the top 20% riskiest carts reaches real abandoners about 72% of the time, versus 48% for random targeting. The cutoff depends on reminder cost and budget.
+Targeting the top 20% reaches actual abandoners about 72% of the time. The right cutoff depends on reminder cost and budget.
 
-**Caveat:** the model identifies who is likely to abandon, not who will respond to a reminder. Measuring reminder effectiveness requires an A/B test (next step: uplift modeling).
+## Limitations
 
-## 11. Next steps
+- **Prediction is not causation.** The model identifies likely abandoners, not users who would respond to a reminder. Measuring reminder impact requires an A/B test.
+- **Same-session label.** Users who return in a later session to complete the purchase are counted as abandoners.
+- **Left censoring.** The data starts on Oct 1, so early-October sessions show little history even for returning customers, and test sessions (late October) have more visible history than training sessions. This may make test results slightly optimistic.
+- **Untuned hyperparameters.** LightGBM uses reasonable defaults; tuning would require a separate validation period.
 
-- Out-of-time test on November 2019 (Black Friday)
-- Add September data to reduce left censoring
-- EDA on `secs_to_first_cart` vs. purchase rate
-- A/B test design for cart reminders
+## Next steps
 
-## 12. How to reproduce
+- Design an A/B test for cart reminders and move toward uplift modeling (who is persuadable, not just who is at risk).
+- Evaluate on November 2019 to test robustness to the Black Friday shift.
+- Add September 2019 data to reduce left censoring.
+- Explore the non-linear relationship between time-to-cart and purchase.
 
-1. Download `2019-Oct.csv.gz` from the dataset page and place it in `data/raw/`
-2. Create the environment: `pip install -r requirements.txt`
-3. Run `notebooks/00_build_model_table.ipynb`, then `notebooks/01_model.ipynb`
+## Repository structure
+
+```
+├── notebooks/
+│   ├── 00_build_model_table.ipynb   # data loading, quality checks, EDA, label and feature tables (SQL)
+│   └── 01_model.ipynb               # models, ablation, user-history features, targeting analysis
+├── requirements.txt
+└── README.md
+```
+
+## How to reproduce
+
+1. Create the data folders: `mkdir -p data/raw data/processed`
+2. Download `2019-Oct.csv.gz` from the [dataset page](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store) (linked under "More datasets" in the data card) and place it in `data/raw/`.
+3. Install dependencies: `pip install -r requirements.txt`
+4. Run `notebooks/00_build_model_table.ipynb`, then `notebooks/01_model.ipynb`.
