@@ -2,17 +2,17 @@
 
 Predicting whether an online shopper who adds an item to the cart will complete the purchase, using 42 million behavioral events from a multi-category e-commerce store. Data processing and feature engineering are done in SQL (DuckDB); modeling and evaluation in Python (scikit-learn, LightGBM).
 
+![Key findings](figures/key_findings.png)
+
 ## Key findings
 
 - **More than half of purchases bypass the cart.** 53.6% of purchasing sessions have no add-to-cart event, so cart-based funnel metrics miss most purchases.
-- **Who the user is matters more than what they do in the session.** Adding three user-history features raised LightGBM ROC-AUC from 0.625 to 0.730.
-- **The model makes reminder targeting 1.5x more precise.** Among the 20% of carts ranked riskiest, 72% are actually abandoned, versus 48% on average.
+- **Who the user is matters more than what they do in the session.** Three user-history features raised LightGBM ROC-AUC from 0.625 to 0.730.
+- **The model makes reminder targeting 1.5× more precise.** Among the 20% of carts ranked riskiest, 72% are actually abandoned, versus 48% overall.
 
 ## Business question
 
-For sessions where a user adds an item to the cart, will the session end in a purchase?
-
-The intended use is prioritizing which carts receive abandonment reminders. Because a "you left something in your cart" message only applies to users with items in their cart, the analysis is scoped to sessions with at least one add-to-cart event. Purchases without a cart event are out of scope.
+An e-commerce store wants to decide which shoppers should receive a "you left something in your cart" reminder. Since the reminder only applies to shoppers with items in their cart, the analysis covers sessions with at least one add-to-cart event and predicts whether each session ends in a purchase. Purchases made without a cart event are out of scope.
 
 ## Data
 
@@ -71,13 +71,9 @@ Time-based split to mimic predicting future sessions from past data: Oct 1–24 
 
 ## Results
 
-| Model | ROC-AUC | PR-AUC | Accuracy |
-|---|---|---|---|
-| Logistic regression | 0.545 | 0.550 | 53.8% |
-| LightGBM | 0.625 | 0.634 | 58.8% |
-| LightGBM (no category) | 0.617 | 0.629 | 58.0% |
-| Logistic regression + history | 0.696 | 0.725 | 64.0% |
-| **LightGBM + history** | **0.730** | **0.751** | **66.7%** |
+<img src="figures/model_auc_heatmap.png" width="75%" alt="Model comparison: ROC-AUC, PR-AUC, and accuracy on the test set" />
+
+*Shading ranks the models within each metric (darker = better).*
 
 - **User history drives most of the gain.** Three history features improved logistic regression by 0.151 and LightGBM by 0.105 in ROC-AUC.
 - **LightGBM's advantage comes from non-linearity, not the category feature.** Removing `cart_category_id` lowers ROC-AUC by only 0.008, while LightGBM still beats logistic regression by 0.073 on identical features.
@@ -99,10 +95,10 @@ Targeting the top 20% reaches actual abandoners about 72% of the time. The right
 
 ## Limitations
 
-- **Prediction is not causation.** The model identifies likely abandoners, not users who would respond to a reminder. Measuring reminder impact requires an A/B test.
-- **Same-session label.** Users who return in a later session to complete the purchase are counted as abandoners.
-- **Left censoring.** The data starts on Oct 1, so early-October sessions show little history even for returning customers, and test sessions (late October) have more visible history than training sessions. This may make test results slightly optimistic.
-- **Untuned hyperparameters.** LightGBM uses reasonable defaults; tuning would require a separate validation period.
+- **Predicts risk, not response.** Whether reminders change behavior requires an A/B test.
+- **Same-session label.** Purchases completed in a later session count as abandonment.
+- **Left censoring.** The data starts on Oct 1, so test sessions (late October) show more user history than training sessions, which may make test results slightly optimistic.
+- **Default hyperparameters.** LightGBM is untuned.
 
 ## Next steps
 
@@ -114,9 +110,11 @@ Targeting the top 20% reaches actual abandoners about 72% of the time. The right
 ## Repository structure
 
 ```
+├── figures/                         # README figures
 ├── notebooks/
 │   ├── 00_build_model_table.ipynb   # data loading, quality checks, EDA, label and feature tables (SQL)
 │   └── 01_model.ipynb               # models, ablation, user-history features, targeting analysis
+├── make_readme_figures.py           # generates figures/ from the reported results
 ├── requirements.txt
 └── README.md
 ```
